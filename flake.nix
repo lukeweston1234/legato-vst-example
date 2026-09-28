@@ -22,7 +22,7 @@
 
           nativeBuildInputs = [
             (pkgs.writeShellScriptBin "run-release" ''
-              exec cargo run --release --manifest-path ./src-legato/Cargo.toml "$@"
+              exec cargo run --release"$@"
             '')
           ];
         };
