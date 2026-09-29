@@ -1,3 +1,5 @@
+use legato_vst::Gain;
+
 fn main() {
-    println!("Hello, world!");
+    nice_plug::prelude::nice_export_standalone::<Gain>();
 }

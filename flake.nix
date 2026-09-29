@@ -20,11 +20,27 @@
         default = pkgs.mkShell {
           inputsFrom = [ legato.devShells.${system}.default ];
 
+          packages = with pkgs; [
+            alsa-lib
+          ];
+
           nativeBuildInputs = [
             (pkgs.writeShellScriptBin "run-release" ''
               exec cargo run --release"$@"
             '')
           ];
+
+          # baseview/winit dlopen these windowing & GL libs at runtime rather than
+          # linking them, so they need to be on LD_LIBRARY_PATH, not just buildInputs.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+            libGL
+            libxkbcommon
+            xorg.libX11
+            xorg.libXcursor
+            xorg.libXi
+            xorg.libXrandr
+            wayland
+          ]);
         };
       });
 
