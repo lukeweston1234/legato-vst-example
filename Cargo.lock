@@ -658,7 +658,6 @@ dependencies = [
  "block2 0.6.2",
  "coreaudio-rs",
  "dasp_sample",
- "jack",
  "jni 0.22.4",
  "js-sys",
  "libc",
@@ -1417,9 +1416,9 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
 name = "legato"
-version = "0.0.47"
+version = "0.0.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f5c461135ddaf4430975f52f877d2530bb245335b18b41b41b10238834fff73"
+checksum = "6825f04f80cb6b30fbafd4059c4760a726fb0da880fb618a78f06381d085cdd3"
 dependencies = [
  "approx",
  "arc-swap",
@@ -1443,13 +1442,10 @@ dependencies = [
 name = "legato-vst"
 version = "0.1.0"
 dependencies = [
- "atomic_float",
  "egui",
  "legato",
  "nice-plug",
  "nice-plug-egui",
- "rtrb 0.4.0",
- "triple_buffer",
 ]
 
 [[package]]
@@ -2862,15 +2858,6 @@ dependencies = [
  "thread_local",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "triple_buffer"
-version = "9.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e875ab7068a75b74f419da453927e05527c36f0001b3c7aad3ce443640683487"
-dependencies = [
- "crossbeam-utils",
 ]
 
 [[package]]

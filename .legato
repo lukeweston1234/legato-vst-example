@@ -1,0 +1,32 @@
+audio {
+    external { interface_name: "main", chans: 2 },
+    plate480: verb { predelay: 32.0, decay: 0.8, damping: 0.3, mix: 1.0 },
+    mult: dry_l { val: 0.2 },
+    mult: dry_r { val: 0.2 },
+    mult: wet_l { val: 0.8 },
+    mult: wet_r { val: 0.8 },
+    track_mixer: out { tracks: 2, chans_per_track: 2, gain: [1.0, 1.0] },
+
+    // dry_amount = 1 - mix
+    mult: negate_mix { val: -1.0 },
+    add: dry_amount { val: 1.0 },
+}
+
+control {
+    signal: mix { name: "mix", min: 0.0, max: 1.0, default: 0.8, smoothing: 0.002 },
+}
+
+external >> verb
+
+external[0] >> dry_l >> out[0]
+external[1] >> dry_r >> out[1]
+verb[0] >> wet_l >> out[2]
+verb[1] >> wet_r >> out[3]
+
+mix >> wet_l.val
+mix >> wet_r.val
+mix >> negate_mix >> dry_amount
+dry_amount >> dry_l.val
+dry_amount >> dry_r.val
+
+{ out }
