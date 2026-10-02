@@ -7,7 +7,8 @@ edition = "2024"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-legato = { version = "0.0.50", default-features = false }
+# Tracks upstream main for host MIDI support in `BlockAdapter`; the exact rev is pinned in Cargo.lock.
+legato = { git = "https://github.com/legato-dsp/legato", branch = "feature/vst-dogfood", default-features = false }
 egui = { version = "0.36.1", features = ["default_fonts"] }
 nice-plug = { version = "0.4.2", features = [
     "assert_process_allocs",

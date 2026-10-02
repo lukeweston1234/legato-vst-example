@@ -4,8 +4,8 @@ use legato::{
     block_adapter::BlockAdapter,
     builder::{LegatoBuilder, Unconfigured},
     config::Config,
+    midi::{MidiMessage, MidiMessageKind},
     msg::{NodeMessage, ParamPayload, RtValue},
-    resources::AudioInputKey,
 };
 use nice_plug::{context::gui::GuiContext, editor::dpi::LogicalSize, prelude::*};
 use nice_plug_egui::{
@@ -14,26 +14,32 @@ use nice_plug_egui::{
 };
 use std::sync::Arc;
 
-const MIN_WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(300.0, 220.0);
+const MIN_WINDOW_SIZE: LogicalSize<f32> = LogicalSize::new(300.0, 320.0);
 const RESIZE_HINT: ResizeHint = ResizeHint::resizable().with_min_logical_size(MIN_WINDOW_SIZE);
 
 /// The fixed block size the Legato graph runs at.
-/// Generally we want this lower, we are reporting this much latency
+/// Generally we want this lower, we have this much latency
 const GRAPH_BLOCK_SIZE: usize = 64;
 const CHANNELS: usize = 2;
 
-const MAIN_INPUT: &str = "main";
+/// The MIDI channel the graph's `poly_voice` listens on.
+/// For this example, host notes on any channel are sent here.
+const GRAPH_MIDI_CHANNEL: u8 = 0;
+
 const REVERB_NODE: &str = "verb";
+const CUTOFF_PARAM: &str = "cutoff";
+const Q_PARAM: &str = "q";
 const MIX_PARAM: &str = "mix";
 
+/// The actual graph used for plugin construction
 const GRAPH: &str = include_str!("../.legato");
 
-pub struct ReverbEditor {
+pub struct SynthEditor {
     gui_ctx: Option<GuiContext>,
-    params: Arc<ReverbParams>,
+    params: Arc<SynthParams>,
 }
 
-impl NiceEguiApp for ReverbEditor {
+impl NiceEguiApp for SynthEditor {
     fn build(
         &mut self,
         _egui_ctx: egui::Context,
@@ -60,8 +66,11 @@ impl NiceEguiApp for ReverbEditor {
                 egui::Frame::new()
                     .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
-                        ui.heading("Legato Plate");
+                        ui.heading("Legato Poly Saw");
+                        // Make the same generic label and slider for each param
                         for param in [
+                            &self.params.cutoff,
+                            &self.params.resonance,
                             &self.params.decay,
                             &self.params.damping,
                             &self.params.bandwidth,
@@ -75,10 +84,12 @@ impl NiceEguiApp for ReverbEditor {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------
-
 #[derive(Params)]
-pub struct ReverbParams {
+pub struct SynthParams {
+    #[id = "cutoff"]
+    pub cutoff: FloatParam,
+    #[id = "resonance"]
+    pub resonance: FloatParam,
     #[id = "decay"]
     pub decay: FloatParam,
     #[id = "damping"]
@@ -89,18 +100,47 @@ pub struct ReverbParams {
     pub mix: FloatParam,
 }
 
-impl Default for ReverbParams {
+impl Default for SynthParams {
+    /// Where all of the params for our synth are declared.
+    ///
+    /// A few notes for those that are new:
+    ///
+    /// - We define a name, default value, range
+    /// - We also have a few different float ranges, which can change scaling
+    /// - We can also format the string value, which is quite cool
     fn default() -> Self {
-        // Ranges match the clamps inside legato's `Plate480::handle_msg`.
+        // Plate ranges match the Legato Plate node
         let unit = |name, default, max| {
             FloatParam::new(name, default, FloatRange::Linear { min: 0.0, max })
                 .with_value_to_string(formatters::v2s_f32_rounded(3))
         };
         Self {
+            // Ranges match the `signal` nodes in `.legato`.
+            cutoff: FloatParam::new(
+                "Cutoff",
+                2400.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            resonance: FloatParam::new(
+                "Resonance",
+                0.7,
+                FloatRange::Skewed {
+                    min: 0.1,
+                    max: 10.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
             decay: unit("Decay", 0.8, 0.9),
             damping: unit("Damping", 0.3, 0.999),
             bandwidth: unit("Bandwidth", 0.9995, 1.0),
-            mix: FloatParam::new("Mix", 0.8, FloatRange::Linear { min: 0.0, max: 1.0 })
+            mix: FloatParam::new("Reverb Mix", 0.3, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_unit("%")
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
                 .with_string_to_value(formatters::s2v_f32_percentage()),
@@ -108,20 +148,22 @@ impl Default for ReverbParams {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------
-
 /// A snapshot of the plugin params for one host block.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
+    pub cutoff: f32,
+    pub resonance: f32,
     pub decay: f32,
     pub damping: f32,
     pub bandwidth: f32,
     pub mix: f32,
 }
 
-impl ReverbParams {
+impl SynthParams {
     pub fn settings(&self) -> Settings {
         Settings {
+            cutoff: self.cutoff.value(),
+            resonance: self.resonance.value(),
             decay: self.decay.value(),
             damping: self.damping.value(),
             bandwidth: self.bandwidth.value(),
@@ -130,12 +172,59 @@ impl ReverbParams {
     }
 }
 
+/// Converts a host note event to a Legato MIDI message at its frame in the host block.
+pub fn to_legato_midi<S>(event: NoteEvent<S>) -> Option<(usize, MidiMessage)> {
+    // Cast our floating point to a MIDI velocity value
+    let velocity = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
+    // Cast our [`NoteEvent`] to MIDI that Legato can read
+    let (timing, data) = match event {
+        NoteEvent::NoteOn {
+            timing,
+            key,
+            velocity: v,
+            ..
+        } => (
+            timing,
+            MidiMessageKind::NoteOn {
+                note: key.number()?,
+                velocity: velocity(v),
+            },
+        ),
+        NoteEvent::NoteOff {
+            timing,
+            key,
+            velocity: v,
+            ..
+        } => (
+            timing,
+            MidiMessageKind::NoteOff {
+                note: key.number()?,
+                velocity: velocity(v),
+            },
+        ),
+        NoteEvent::Choke { timing, key, .. } => (
+            timing,
+            MidiMessageKind::NoteOff {
+                note: key.number()?,
+                velocity: 0,
+            },
+        ),
+        _ => return None,
+    };
+    Some((
+        timing as usize,
+        MidiMessage {
+            data,
+            channel_idx: GRAPH_MIDI_CHANNEL,
+        },
+    ))
+}
+
 /// Everything that depends on the sample rate, built in [`Plugin::activate`].
 pub struct Engine {
     app: LegatoApp,
     frontend: LegatoFrontend,
     adapter: BlockAdapter,
-    input: AudioInputKey,
     /// The last plate settings sent to the graph, so we only send messages on change.
     sent: Option<Settings>,
 }
@@ -149,17 +238,14 @@ impl Engine {
             rt_capacity: 0,
         };
         let (app, frontend) = LegatoBuilder::<Unconfigured>::new(config)
-            .register_host_audio_input(MAIN_INPUT, CHANNELS)
             .build_dsl(GRAPH)
-            .expect("reverb graph should build");
+            .expect("synth graph should build");
         let adapter = BlockAdapter::new(&app);
-        let input = app.audio_input_key(MAIN_INPUT).unwrap();
 
         Self {
             app,
             frontend,
             adapter,
-            input,
             sent: None,
         }
     }
@@ -170,17 +256,24 @@ impl Engine {
 
     /// Forward plugin params to the graph.
     fn sync_params(&mut self, settings: Settings) {
-        // `mix` feeds a smoothed `signal` node; this is a lock-free atomic store.
+        // These feed smoothed `signal` nodes from a lock-free atomic store.
+        let _ = self.frontend.set_param(CUTOFF_PARAM, settings.cutoff);
+        let _ = self.frontend.set_param(Q_PARAM, settings.resonance);
         let _ = self.frontend.set_param(MIX_PARAM, settings.mix);
 
         // `plate480` has no control inputs yet, so its params are messages, drained once per
         // graph block and applied unsmoothed.
+        //
+        // Could be nice to add this later for audio rate, but `plate480` was more for quick demos
+
+        // Hold onto our last value to only send messages when required
         let sent = self.sent.replace(settings);
         let plate_params = [
             ("decay", settings.decay, sent.map(|s| s.decay)),
             ("damping", settings.damping, sent.map(|s| s.damping)),
             ("bandwidth", settings.bandwidth, sent.map(|s| s.bandwidth)),
         ];
+        // If any param values do not match our current values, send a message and update
         for (param_name, value, prev) in plate_params {
             if Some(value) != prev {
                 let msg = NodeMessage::SetParam(ParamPayload {
@@ -192,37 +285,46 @@ impl Engine {
         }
     }
 
-    pub fn process(&mut self, settings: Settings, io: &mut [&mut [f32]]) {
+    /// Render into IO from the internal Legato app
+    ///
+    /// It looks like midi messages here are already pre-sorted,
+    /// we pass these in as well where they will be adapted to fit
+    /// Legato's internal midi tooling.
+    pub fn process(
+        &mut self,
+        settings: Settings,
+        io: &mut [&mut [f32]],
+        midi: impl IntoIterator<Item = (usize, MidiMessage)>,
+    ) {
         self.sync_params(settings);
-        self.adapter
-            .process(&mut self.app, Some(self.input), io, &[]);
+        self.adapter.process(&mut self.app, None, io, &[], midi);
     }
 
+    // TODO: Nodes do not actually have a reset trait yet, good
+    // first issue if anyone is interested!
     pub fn reset(&mut self) {
         self.adapter.reset();
     }
 }
 
-// ---------------------------------------------------------------------------------------------------
-
-pub struct LegatoReverb {
-    params: Arc<ReverbParams>,
+pub struct LegatoSynth {
+    params: Arc<SynthParams>,
     editor_state: Arc<EguiEditorState>,
     engine: Option<Engine>,
 }
 
-impl Default for LegatoReverb {
+impl Default for LegatoSynth {
     fn default() -> Self {
         Self {
-            params: Arc::new(ReverbParams::default()),
+            params: Arc::new(SynthParams::default()),
             editor_state: EguiEditorState::from_size(MIN_WINDOW_SIZE, 1.0),
             engine: None,
         }
     }
 }
 
-impl Plugin for LegatoReverb {
-    const NAME: &'static str = "Legato Plate";
+impl Plugin for LegatoSynth {
+    const NAME: &'static str = "Legato Poly Saw";
     const VENDOR: &'static str = "Legato";
     const URL: &'static str = "https://github.com/legato-dsp/legato";
     const EMAIL: &'static str = "info@example.com";
@@ -230,12 +332,14 @@ impl Plugin for LegatoReverb {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
-        main_input_channels: NonZeroU32::new(CHANNELS as u32),
+        main_input_channels: None,
         main_output_channels: NonZeroU32::new(CHANNELS as u32),
         ..AudioIOLayout::const_default()
     }];
 
-    type Editor = EguiEditor<ReverbEditor>;
+    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+
+    type Editor = EguiEditor<SynthEditor>;
     type SysExMessage = ();
     type BackgroundTask = ();
 
@@ -248,13 +352,16 @@ impl Plugin for LegatoReverb {
             self.editor_state.clone(),
             RepaintNotifier::new(),
             EguiNiceSettings::new().with_resize_hint(RESIZE_HINT),
-            ReverbEditor {
+            SynthEditor {
                 gui_ctx: None,
                 params: self.params.clone(),
             },
         )
     }
 
+    /// Startup the actual plugin
+    ///
+    /// This is where all of the allocation and initial construction will occur
     fn activate(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
@@ -277,116 +384,36 @@ impl Plugin for LegatoReverb {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         if let Some(engine) = &mut self.engine {
-            engine.process(self.params.settings(), buffer.as_slice());
+            // Host events arrive in timing order, which the block adapter expects.
+            let midi = std::iter::from_fn(|| context.next_event()).filter_map(to_legato_midi);
+            engine.process(self.params.settings(), buffer.as_slice(), midi);
         }
-        // Keep processing through silence so the tail rings out.
+        // Keep processing so reverb/tails ring out
         ProcessStatus::KeepAlive
     }
 }
 
-impl ClapPlugin for LegatoReverb {
-    const CLAP_ID: &'static str = "dev.legato.plate";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("A Legato plate reverb");
+/// Where the plugin metadata lives
+impl ClapPlugin for LegatoSynth {
+    const CLAP_ID: &'static str = "dev.legato.poly-saw";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("A Legato polyphonic sawtooth synth");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
-        ClapFeature::AudioEffect,
+        ClapFeature::Instrument,
+        ClapFeature::Synthesizer,
         ClapFeature::Stereo,
-        ClapFeature::Reverb,
     ];
 }
 
-impl Vst3Plugin for LegatoReverb {
-    const VST3_CLASS_ID: [u8; 16] = *b"LegatoPlateVerb!";
+impl Vst3Plugin for LegatoSynth {
+    const VST3_CLASS_ID: [u8; 16] = *b"LegatoPolySaw!!!";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::Reverb];
+        &[Vst3SubCategory::Instrument, Vst3SubCategory::Synth];
 }
 
-nice_export_clap!(LegatoReverb);
-nice_export_vst3!(LegatoReverb);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn settings(mix: f32) -> Settings {
-        Settings {
-            mix,
-            ..ReverbParams::default().settings()
-        }
-    }
-
-    /// Runs `frames` of `input` (the same on both channels) through the engine in one call.
-    fn render(engine: &mut Engine, settings: Settings, input: &[f32]) -> [Vec<f32>; 2] {
-        let mut l = input.to_vec();
-        let mut r = input.to_vec();
-        engine.process(settings, &mut [&mut l, &mut r]);
-        [l, r]
-    }
-
-    #[test]
-    fn fully_dry_mix_is_a_delayed_passthrough() {
-        let mut engine = Engine::new(48_000);
-        // Let the smoothed mix signal settle at 0 before measuring.
-        render(&mut engine, settings(0.0), &[0.0; 48_000]);
-
-        let mut impulse = vec![0.0; 1024];
-        impulse[0] = 1.0;
-        let latency = engine.latency_samples();
-        for chan in render(&mut engine, settings(0.0), &impulse) {
-            for (i, s) in chan.iter().enumerate() {
-                let expected = if i == latency { 1.0 } else { 0.0 };
-                assert!((s - expected).abs() < 1e-4, "sample {i}: {s}");
-            }
-        }
-    }
-
-    #[test]
-    fn mix_changes_are_smoothed() {
-        let mut engine = Engine::new(48_000);
-        render(&mut engine, settings(0.0), &[1.0; 48_000]);
-
-        // Jumping to fully wet should fade the dry signal out, not cut it on the next block.
-        let [l, _] = render(&mut engine, settings(1.0), &[1.0; 512]);
-        let after_step = &l[engine.latency_samples()..];
-        assert!(
-            after_step[0] > 0.9,
-            "dry cut off instantly: {}",
-            after_step[0]
-        );
-        assert!(after_step.windows(2).all(|w| (w[1] - w[0]).abs() < 0.01));
-    }
-
-    #[test]
-    fn impulse_produces_a_delayed_tail_under_odd_host_blocks() {
-        let mut engine = Engine::new(48_000);
-        let settings = ReverbParams::default().settings();
-        let mut energy = 0.0;
-        let mut first_nonzero = None;
-        let mut at = 0;
-
-        for n in [1, 37, 128, 511, 64, 300].into_iter().cycle().take(200) {
-            let mut l = vec![0.0; n];
-            let mut r = vec![0.0; n];
-            if at == 0 {
-                l[0] = 1.0;
-                r[0] = 1.0;
-            }
-            engine.process(settings, &mut [&mut l, &mut r]);
-            for (i, s) in l.iter().chain(&r).enumerate() {
-                assert!(s.is_finite());
-                if *s != 0.0 && first_nonzero.is_none() {
-                    first_nonzero = Some(at + i % n);
-                }
-                energy += s * s;
-            }
-            at += n;
-        }
-
-        assert_eq!(first_nonzero, Some(engine.latency_samples()));
-        assert!(energy > 1e-3, "reverb tail was silent");
-    }
-}
+nice_export_clap!(LegatoSynth);
+nice_export_vst3!(LegatoSynth);
